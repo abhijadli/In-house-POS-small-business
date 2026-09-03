@@ -19,7 +19,7 @@ class Products(Base):
     description = Column(String(255), nullable=True, default=None)
     price = Column(Numeric(10, 2), nullable=False)
     discount = Column(Numeric(10, 2), nullable=False)
-    inventory = Column(Integer, nullable=False, default=0)
+    inventory = Column(Integer, nullable=False, default=1)
     is_deleted = Column(Boolean, nullable=False, default=False)
     updated_at = Column(
         DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow

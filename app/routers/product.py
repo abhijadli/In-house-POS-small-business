@@ -1,4 +1,4 @@
-from fastapi import Depends, APIRouter, HTTPException, status
+from fastapi import Depends, APIRouter, HTTPException, status, UploadFile, File
 from app.db.session import get_db
 from app.core.deps import require_super, get_current_user
 from app.services.product import (
@@ -8,6 +8,7 @@ from app.services.product import (
     remove_product_from_catalogue,
     patch_inventory,
     patch_product,
+    import_products_from_file,
 )
 from app.schema.product import (
     ProductCreate,
@@ -18,6 +19,7 @@ from app.models.user import Users
 from app.models.product import Products
 from app.exception.product_exception import (
     InvalidProductError,
+    ProductImportError,
 )
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,6 +43,31 @@ async def create_new_product_for_catalogue(
     db: AsyncSession = Depends(get_db),
 ):
     return await add_product_to_catalogue(db, product)
+
+
+@product_router.post(
+    "/import_file",
+    status_code=status.HTTP_201_CREATED,
+    response_model=list[ProductResponse],
+    summary="To create bulk products using excel file",
+)
+async def import_products_for_catalogue(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    user: Users = Depends(require_super),
+):
+    if not file.filename or not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Only excel file supported.",
+        )
+    content: bytes = await file.read()
+    try:
+        return await import_products_from_file(db, content)
+    except ProductImportError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
 
 
 # Read

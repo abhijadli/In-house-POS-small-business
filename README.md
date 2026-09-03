@@ -6,6 +6,23 @@ catalogue, build a customer's order (a direct single-item purchase or a cart
 checkout), collect payment (cash or online), and keep inventory consistent
 across all of those flows. All money values are in **INR (₹)**.
 
+**Repository:** https://github.com/abhijadli/In-house-POS-small-business
+
+---
+
+## Tech stack
+
+| Layer | Choice |
+|---|---|
+| Framework | FastAPI + Uvicorn |
+| Database | PostgreSQL via SQLAlchemy 2 (async) + asyncpg |
+| Migrations | Alembic |
+| Auth | JWT access tokens + hashed refresh tokens (python-jose, argon2) |
+| Validation | Pydantic v2 |
+| Scheduling | APScheduler (abandoned-cart cleanup) |
+| File import | openpyxl (`.xlsx` bulk product upload) |
+| Testing | pytest + pytest-asyncio + httpx + pytest-cov |
+
 ---
 
 ## 1. What this app is
@@ -39,6 +56,9 @@ console / web app) and expose the data + business rules that UI needs.
    gateway calls back via a webhook to mark the order `successful` or `failed`.
 5. **Abandoned cart cleanup** — a scheduled job restocks and clears carts that
    have been idle longer than their TTL (30 minutes).
+6. **Bulk catalogue import** — a superadmin uploads an Excel workbook (`.xlsx`)
+   to seed or update many products in one atomic operation (all rows succeed or
+   none are inserted).
 
 ### Roles & permissions
 | Role | Can do |
@@ -133,12 +153,18 @@ API at `http://localhost:8000`; interactive docs at `/docs` (Swagger) and `/redo
 ### Run the tests
 ```bash
 python -m pytest
+
+# with coverage report
+python -m pytest --cov=app --cov-report=term-missing
 ```
+
+The suite currently has **101 tests** and **~96% line coverage** across `app/`.
 
 ### Functionalities (summary)
 - JWT auth (access + refresh tokens, single active session per user, token
   versioning for password-change invalidation).
 - Product catalogue CRUD with soft delete.
+- **Bulk product import from Excel** (`.xlsx`, atomic all-or-nothing).
 - Per-user cart with inventory reservation.
 - Orders: direct buy + cart checkout, with line items and a single payment
   record per order.
@@ -172,11 +198,56 @@ the `Authorization: Bearer <token>` header. `require_super` means an `ADMIN` or
 | Method | Path | Auth | Body / Params | Returns | Notes |
 |---|---|---|---|---|---|
 | POST | `/products` | `require_super` | `ProductCreate {name, description?, price, discount, inventory}` | `201 ProductResponse` | `price > 0`, `discount >= 0`. |
+| POST | `/products/import_file` | `require_super` | Multipart `file` (`.xlsx`) | `201 [ProductResponse]` | Imports all valid rows atomically. Required columns: `name`, `price`, `discount`, `inventory`; `description` is optional. |
 | GET | `/products` | `get_current_user` | — | `200 [ProductResponse]` | Lists non-deleted products, ordered by name. |
 | GET | `/products/{id}` | `get_current_user` | — | `200 ProductResponse` | `404` if not found / soft-deleted. |
 | PATCH | `/products/{id}/inventory` | `require_super` | query `?new_inventory=N` | `200` product | Sets inventory to an absolute value. |
 | PATCH | `/products/{id}/details` | `require_super` | `ProductUpdate {name?, description?, price?, discount?}` | `201 ProductResponse` | Partial update (only sent fields change). |
 | DELETE | `/products/{id}` | `require_super` | — | `200 ProductResponse` | Soft delete (`is_deleted = true`). |
+
+#### Bulk import — `POST /products/import_file`
+
+Upload a multipart form with field name `file` containing a `.xlsx` workbook.
+The router reads the file bytes and delegates parsing + validation to
+`import_products_from_file` in the service layer.
+
+**Excel template (row 1 = headers, row 2+ = data):**
+
+| name | description | price | discount | inventory |
+|---|---|---:|---:|---:|
+| Keyboard | USB keyboard | 1200 | 100 | 8 |
+| Mouse | | 600 | 0 | 15 |
+
+| Column | Required | Rules |
+|---|---|---|
+| `name` | yes | non-empty text, max 255 chars |
+| `description` | no | text, max 255 chars; blank cell → `null` |
+| `price` | yes | number, must be `> 0` |
+| `discount` | yes | number, must be `>= 0` |
+| `inventory` | yes | whole number `>= 0` |
+
+Header names are case-insensitive; spaces are normalized to underscores
+(e.g. `Product Name` → `product_name` won't match — use `name`). Fully blank
+rows are skipped.
+
+**HTTP responses:**
+
+| Situation | Status | Example detail |
+|---|---|---|
+| Success | `201` | `[ProductResponse, ...]` |
+| Not `.xlsx` | `415` | `Only excel file supported.` |
+| Bad workbook / validation | `422` | `Row 4: price must be greater than 0.` |
+| Not super role | `403` | — |
+
+Import is **atomic**: every row is validated first; if any row fails, nothing is
+committed. On success, all products are inserted in a single transaction.
+
+**Example (curl):**
+```bash
+curl -X POST http://localhost:8000/products/import_file \
+  -H "Authorization: Bearer <super_token>" \
+  -F "file=@products.xlsx"
+```
 
 ### Cart — prefix `/cart`
 Each user has one cart. Adding to cart **decrements** product inventory;
@@ -352,10 +423,20 @@ app/
   schema/      Pydantic DTOs (user, product, cart, orders, payments)
   services/    auth, product, cart, orders (business logic), payments (factory+adapters)
   routers/     auth, product, cart, orders, payments
-  exception/   domain exceptions (auth, product, cart, order, payment)
+  exception/   domain exceptions (auth, product incl. ProductImportError,
+               cart, order, payment)
   jobs/        my_job.py (abandoned-cart cleanup)
   scheduler.py APScheduler wiring
-conftest.py / tests/         pytest harness + suite
+conftest.py                  pytest DB harness (test engine override, seed users)
+tests/
+  test_auth.py               login, refresh, logout, user management
+  test_product.py            catalogue CRUD + Excel import
+  test_cart.py               cart flows + inventory reservation
+  test_orders.py             direct buy, checkout, validation
+  test_payments.py           Stripe/Razorpay webhooks + idempotency
+  test_job.py                abandoned-cart scheduler job
+  test_coverage.py           security, payments factory, parser edge cases
+  test_health.py             liveness probe
 ```
 
 ### Adding a new payment gateway
@@ -401,7 +482,10 @@ failure doesn't abort the run.
   pytest-asyncio uses a fresh event loop per test).
 - The job test patches `app.jobs.my_job.SessionLocal` to the test sessionmaker
   (the job otherwise uses the production engine).
-- Run: `python -m pytest` (50 tests).
+- Excel import tests build in-memory `.xlsx` files with `openpyxl` (no fixture
+  files on disk).
+- Run: `python -m pytest` (**101 tests**, **~96% coverage**).
+- Coverage: `python -m pytest --cov=app --cov-report=term-missing`
 
 ### Migrations
 `alembic/env.py` imports all model modules so `Base.metadata` is complete, and
@@ -431,11 +515,12 @@ python -m alembic downgrade -1        # one step back
 ### Key conventions
 - Money is `Numeric(10,2)`; `net_price` is per-unit, `total_price` is the
   qty-adjusted tax-inclusive line total. `round(..., 2)` is used for tax.
+- Products default to `inventory = 1` at the DB model level; API create/import
+  still requires an explicit `inventory` value.
 - Soft delete (`is_deleted`) for users and products; orders/payments are never
   deleted, only status-changed.
 - Domain exceptions are mapped to specific HTTP codes in the routers (e.g.
   `PaymentGatewayError → 503`, `CartEmptyError → 400`, `ProductOutOfStock → 403`,
-  `InvalidProductError → 404`).
+  `InvalidProductError → 404`, `ProductImportError → 422`).
 - `SUPER_ROLES` (ADMIN + SUPERADMIN) gate product/user management.
-
-
+- File uploads use `python-multipart` (declared in `requirements.txt`).

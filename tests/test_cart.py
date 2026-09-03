@@ -4,6 +4,13 @@ from conftest import auth_header, create_product
 
 
 @pytest.mark.asyncio
+async def test_delete_entry_no_entry(super_client, super_token, user_client):
+    prod = await create_product(super_client, super_token)
+    resp = await user_client.delete(f"/cart/{prod['id']}/delete_entry")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_add_to_cart_and_inventory_decrements(
     super_client, super_token, user_client
 ):

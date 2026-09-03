@@ -19,6 +19,102 @@ def razorpay_body():
 
 
 @pytest.mark.asyncio
+async def test_get_order_items_not_found(user_client):
+    resp = await user_client.get("/orders/9999/items")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_superadmin_lists_all_orders(super_client, super_token, user_client):
+    prod = await create_product(super_client, super_token, inventory=5)
+    await user_client.post(f"/orders/{prod['id']}", params=TAX, json=cash_body())
+
+    listed = await super_client.get("/orders")
+    assert listed.status_code == 200
+    assert len(listed.json()) >= 1
+
+
+@pytest.mark.asyncio
+async def test_checkout_fails_when_cart_product_deleted(
+    super_client, super_token, user_client
+):
+    prod = await create_product(super_client, super_token, inventory=5)
+    await user_client.post(f"/cart/{prod['id']}/add_product")
+    await super_client.delete(
+        f"/products/{prod['id']}", headers=auth_header(super_token)
+    )
+
+    resp = await user_client.post(
+        "/orders/checkout/cart", params=TAX, json=cash_body()
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_direct_buy_payment_gateway_failure(
+    monkeypatch, super_client, super_token, user_client
+):
+    class FailingAdapter:
+        def create_payment(self, order, payment):
+            raise RuntimeError("gateway down")
+
+    monkeypatch.setattr(
+        "app.services.orders.PaymentGatewayFactory.get",
+        lambda gateway: FailingAdapter(),
+    )
+
+    prod = await create_product(super_client, super_token, inventory=5)
+    resp = await user_client.post(
+        f"/orders/{prod['id']}", params=TAX, json=stripe_body()
+    )
+    assert resp.status_code == 503
+    inv = (await user_client.get(f"/products/{prod['id']}")).json()["inventory"]
+    assert inv == 5
+
+
+@pytest.mark.asyncio
+async def test_checkout_cart_payment_gateway_failure(
+    monkeypatch, super_client, super_token, user_client
+):
+    class FailingAdapter:
+        def create_payment(self, order, payment):
+            raise RuntimeError("gateway down")
+
+    monkeypatch.setattr(
+        "app.services.orders.PaymentGatewayFactory.get",
+        lambda gateway: FailingAdapter(),
+    )
+
+    prod = await create_product(super_client, super_token, inventory=5)
+    await user_client.post(f"/cart/{prod['id']}/add_product")
+    resp = await user_client.post(
+        "/orders/checkout/cart", params=TAX, json=stripe_body()
+    )
+    assert resp.status_code == 503
+    cart = await user_client.get("/cart")
+    assert cart.json() == []
+    inv = (await user_client.get(f"/products/{prod['id']}")).json()["inventory"]
+    assert inv == 5
+
+
+@pytest.mark.asyncio
+async def test_invalid_but_parseable_mobile_rejected(
+    user_client, super_client, super_token
+):
+    prod = await create_product(super_client, super_token)
+    resp = await user_client.post(
+        f"/orders/{prod['id']}",
+        params=TAX,
+        json={
+            "customer": {"name": "Abhi", "mobile": "+911234"},
+            "method": "cash",
+            "gateway": None,
+        },
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_direct_buy_cash(super_client, super_token, user_client):
     prod = await create_product(super_client, super_token, inventory=5)
     resp = await user_client.post(
